@@ -1,5 +1,5 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge — Full Market BTST + Options Version
+# 🧠 Dhan FastAPI Bridge — BTST + Options (Vercel Optimized)
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -14,8 +14,8 @@ from io import StringIO
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="3.1.0",
-    description="Live market intelligence bridge: BTST Scanner, Single Stock Scan, Option Chain, and Simulated Orders."
+    version="3.2.0",
+    description="Vercel-optimized Dhan market data bridge — BTST scanner, option chain, and trade simulation."
 )
 
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
@@ -32,7 +32,7 @@ def home():
     return {
         "status": "ok",
         "message": "Dhan FastAPI Bridge (Full Market BTST + Options) 🚀",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "endpoints": {
             "health": "/health",
             "scan_one": "/scan?symbol=RELIANCE",
@@ -53,23 +53,29 @@ def health_check():
 # 📊 Single Stock Scan
 # =========================================================
 @app.get("/scan")
-def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE")):
+def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE, TCS, HDFCBANK")):
     """
-    Fetch live market quote for a given symbol.
+    Fetch live market quote for a given symbol with flexible matching.
     """
     try:
         csv_response = requests.get(MASTER_CSV, timeout=10)
-        csv_data = csv.DictReader(StringIO(csv_response.text))
+        csv_data = list(csv.DictReader(StringIO(csv_response.text)))
 
+        symbol_upper = symbol.upper()
         equity = next(
-            (r for r in csv_data if r["SYMBOL_NAME"].upper() == symbol.upper()),
+            (
+                r for r in csv_data
+                if symbol_upper in r["SYMBOL_NAME"].upper()
+                or symbol_upper in r["DISPLAY_NAME"].upper()
+                or symbol_upper in r["UNDERLYING_SYMBOL"].upper()
+            ),
             None
         )
         if not equity:
-            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found")
+            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found in Dhan master CSV")
 
-        security_id = int(equity["SECURITY_ID"])
         exch = equity["EXCH_ID"].upper()
+        security_id = int(equity["SECURITY_ID"])
         quote_key = "NSE_EQ" if exch == "NSE" else "BSE_EQ"
 
         payload = {quote_key: [security_id]}
@@ -81,7 +87,7 @@ def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE"
                 "client-id": DHAN_CLIENT_ID,
                 "Content-Type": "application/json",
             },
-            timeout=8,
+            timeout=6,
         )
 
         if res.status_code != 200:
@@ -89,7 +95,7 @@ def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE"
 
         return {
             "status": "success",
-            "symbol": symbol.upper(),
+            "symbol": equity["SYMBOL_NAME"],
             "exchange": exch,
             "security_id": security_id,
             "quote": res.json(),
@@ -123,7 +129,7 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
                 "security_id": int(r["SECURITY_ID"]),
             }
             for r in csv_data
-            if r["UNDERLYING_SYMBOL"].upper() == symbol.upper()
+            if symbol.upper() in r["UNDERLYING_SYMBOL"].upper()
             and "OPT" in r["INSTRUMENT"].upper()
             and (not expiry or r["SM_EXPIRY_DATE"] == expiry)
         ]
@@ -146,30 +152,32 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
         return {"status": "error", "reason": str(e)}
 
 # =========================================================
-# 📈 Bulk Market BTST Scanner
+# ⚡ Optimized BTST Scanner (Safe for Vercel Runtime)
 # =========================================================
 @app.get("/scan/all")
-def scan_all(limit: int = Query(50, description="Top results to return (default: 50)")):
+def scan_all(
+    limit: int = Query(50, description="Top results to return"),
+    sample_size: int = Query(150, description="Number of equities to scan (default: 150)")
+):
     """
-    Scans the entire Dhan equity universe (NSE/BSE cash)
-    and returns top BTST opportunities with bias and confidence.
+    Fast BTST Scanner — scans a limited subset of equities (default 150) for Vercel runtime safety.
     """
     try:
         csv_response = requests.get(MASTER_CSV, timeout=15)
-        csv_data = csv.DictReader(StringIO(csv_response.text))
+        csv_data = list(csv.DictReader(StringIO(csv_response.text)))
 
         equities = [
             r for r in csv_data
             if r["SEGMENT"].upper() != "D"
             and "OPT" not in r["INSTRUMENT"].upper()
             and "FUT" not in r["INSTRUMENT"].upper()
-            and r["EXCH_ID"].upper() in ["NSE", "BSE"]
-        ]
+            and r["EXCH_ID"].upper() == "NSE"
+        ][:sample_size]
 
         results = []
         for eq in equities:
             try:
-                symbol = eq["SYMBOL_NAME"]
+                symbol = eq["SYMBOL_NAME"].strip()
                 exch = eq["EXCH_ID"].upper()
                 security_id = int(eq["SECURITY_ID"])
                 quote_key = "NSE_EQ" if exch == "NSE" else "BSE_EQ"
@@ -183,7 +191,7 @@ def scan_all(limit: int = Query(50, description="Top results to return (default:
                         "client-id": DHAN_CLIENT_ID,
                         "Content-Type": "application/json",
                     },
-                    timeout=4,
+                    timeout=5,
                 )
 
                 if res.status_code != 200:
@@ -197,7 +205,6 @@ def scan_all(limit: int = Query(50, description="Top results to return (default:
                 last_price = q.get("last_price", 0)
                 close = ohlc.get("close", 0) or 1
 
-                # Technical bias logic
                 if last_price > close * 1.01:
                     bias = "BULLISH"
                     confidence = 80
@@ -225,6 +232,7 @@ def scan_all(limit: int = Query(50, description="Top results to return (default:
             "timestamp": datetime.utcnow().isoformat(),
             "symbols_scanned": len(results),
             "top_results": results[:limit],
+            "note": "Fast scan mode active — limited to top 150 equities for Vercel runtime."
         }
 
     except Exception as e:
@@ -240,7 +248,7 @@ def place_order(
     side: str = Query(..., regex="^(BUY|SELL|buy|sell)$")
 ):
     """
-    Simulates a buy/sell order (for GPT strategy testing).
+    Simulates a buy/sell order for GPT testing and analysis workflows.
     """
     return {
         "status": "success",
