@@ -1,53 +1,23 @@
 # main.py
 from fastapi import FastAPI, Query
-import requests, csv, io, os, time
-from datetime import datetime, timedelta
+import requests, csv, io
+from datetime import datetime
+from dhan_auth import DhanAuth
 
-app = FastAPI()
+app = FastAPI(title="Dhan Market Data Bridge", version="1.0")
 
-# Load credentials
-DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
-DHAN_REFRESH_TOKEN = os.getenv("DHAN_REFRESH_TOKEN")
-DHAN_BASE_URL = os.getenv("DHAN_BASE_URL", "https://api.dhan.co")
-
-# In-memory store for access token and expiry
-token_cache = {
-    "access_token": DHAN_ACCESS_TOKEN,
-    "expires_at": time.time() + 3600  # assume valid for 1 hour initially
-}
+auth = DhanAuth()
+DHAN_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
 
-def refresh_token_if_needed():
-    """Refresh the Dhan access token automatically if expired."""
-    if time.time() < token_cache["expires_at"]:
-        return token_cache["access_token"]
+def fetch_csv():
+    """Load Dhan master CSV into a list of dicts"""
+    resp = requests.get(DHAN_CSV_URL)
+    resp.raise_for_status()
+    return list(csv.DictReader(io.StringIO(resp.text)))
 
-    if not DHAN_REFRESH_TOKEN:
-        print("⚠️ No refresh token found — using old token.")
-        return token_cache["access_token"]
 
-    try:
-        print("🔁 Refreshing Dhan token...")
-        url = f"{DHAN_BASE_URL}/token/refresh"
-        resp = requests.post(url, json={
-            "client_id": DHAN_CLIENT_ID,
-            "refresh_token": DHAN_REFRESH_TOKEN
-        })
-
-        if resp.status_code != 200:
-            print("❌ Refresh failed:", resp.text)
-            return token_cache["access_token"]
-
-        data = resp.json()
-        token_cache["access_token"] = data["access_token"]
-        token_cache["expires_at"] = time.time() + int(data.get("expires_in", 3600))
-        print("✅ Token refreshed successfully.")
-        return token_cache["access_token"]
-
-    except Exception as e:
-        print("❌ Token refresh error:", e)
-        return token_cache["access_token"]
+def norm(x): return (x or "").strip().upper()
 
 
 @app.get("/health")
@@ -56,39 +26,85 @@ def health():
 
 
 @app.get("/scan")
-def scan(symbol: str = Query(...)):
-    """Fetch stock quote."""
-    access_token = refresh_token_if_needed()
-
+def scan(symbol: str = Query(..., description="Symbol like RELIANCE or TCS")):
+    """Fetch live equity quote"""
     try:
-        # Fetch Dhan CSV
-        csv_data = requests.get("https://images.dhan.co/api-data/api-scrip-master-detailed.csv")
-        rows = list(csv.DictReader(io.StringIO(csv_data.text)))
+        rows = fetch_csv()
+        cash_rows = [r for r in rows if norm(r["SEGMENT"]) != "D"]
 
-        # Find equity row
-        symbol = symbol.upper()
         equity = next(
-            (r for r in rows if r.get("SYMBOL_NAME", "").upper() == symbol),
+            (r for r in cash_rows if norm(r["SYMBOL_NAME"]) == norm(symbol)
+             or norm(r["UNDERLYING_SYMBOL"]) == norm(symbol)
+             or norm(r["DISPLAY_NAME"]).startswith(norm(symbol))),
             None
         )
         if not equity:
-            return {"status": "error", "reason": f"{symbol} not found"}
+            return {"status": "error", "reason": f"Symbol {symbol} not found"}
 
-        exch = "NSE_EQ" if equity["EXCH_ID"] == "NSE" else "BSE_EQ"
+        exch = "NSE_EQ" if norm(equity["EXCH_ID"]) == "NSE" else "BSE_EQ"
         sec_id = int(equity["SECURITY_ID"])
+        token = auth.get_token()
 
-        # Fetch quote
         quote = requests.post(
-            f"{DHAN_BASE_URL}/v2/marketfeed/quote",
+            f"{auth.base_url}/v2/marketfeed/quote",
             json={exch: [sec_id]},
             headers={
-                "access-token": access_token,
-                "client-id": DHAN_CLIENT_ID,
-                "Content-Type": "application/json",
-            },
+                "access-token": token,
+                "client-id": auth.client_id,
+                "Content-Type": "application/json"
+            }
         )
 
-        return quote.json()
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "exchange": exch,
+            "security_id": sec_id,
+            "display_name": equity["DISPLAY_NAME"],
+            "quote": quote.json(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
+@app.get("/optionchain")
+def option_chain(symbol: str = Query(...), expiry: str | None = None):
+    """Fetch option chain contracts"""
+    try:
+        rows = fetch_csv()
+        options = [
+            r for r in rows
+            if norm(r["SEGMENT"]) == "D"
+            and norm(r["INSTRUMENT"]) in ("OPTSTK", "OPTIDX")
+            and norm(r["UNDERLYING_SYMBOL"]) == norm(symbol)
+        ]
+
+        if not options:
+            return {"status": "error", "reason": f"No option data found for {symbol}"}
+
+        options.sort(key=lambda x: x.get("SM_EXPIRY_DATE") or "2100-01-01")
+        expiry_date = expiry or options[0]["SM_EXPIRY_DATE"]
+
+        filtered = [r for r in options if r["SM_EXPIRY_DATE"] == expiry_date]
+        contracts = [
+            {
+                "display_name": r["DISPLAY_NAME"],
+                "strike": r["STRIKE_PRICE"],
+                "option_type": r["OPTION_TYPE"],
+                "lot_size": r["LOT_SIZE"],
+                "expiry": r["SM_EXPIRY_DATE"]
+            } for r in filtered
+        ][:40]
+
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "expiry": expiry_date,
+            "contracts": contracts,
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
     except Exception as e:
         return {"status": "error", "reason": str(e)}
