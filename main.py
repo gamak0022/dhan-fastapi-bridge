@@ -1,21 +1,21 @@
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from dhan_auth import DhanAuth
 from dhan_trade import place_order, order_status, cancel_order
-import requests, csv, io, os
+import os, requests
 from datetime import datetime
 
-app = FastAPI(title="Dhan Trading Bridge", version="2.0")
+app = FastAPI(title="Dhan FastAPI Trading Bridge", version="2.0")
 auth = DhanAuth()
 
-API_KEY = os.getenv("GPT_API_KEY")
-
-@app.middleware("http")
-async def verify_key(request: Request, call_next):
-    if request.url.path not in ["/", "/health"]:
-        if request.headers.get("x-api-key") != API_KEY:
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-    return await call_next(request)
+# Optional protection: uncomment if you want API key
+# API_KEY = os.getenv("GPT_API_KEY")
+# @app.middleware("http")
+# async def verify_key(request: Request, call_next):
+#     if request.url.path not in ["/", "/health"]:
+#         if request.headers.get("x-api-key") != API_KEY:
+#             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+#     return await call_next(request)
 
 @app.get("/")
 def home():
@@ -25,7 +25,7 @@ def home():
         "endpoints": {
             "health": "/health",
             "quote": "/scan?symbol=RELIANCE",
-            "optionchain": "/optionchain?symbol=NIFTY",
+            "optionchain": "/optionchain?symbol=TCS",
             "order": "/order/place"
         }
     }
@@ -34,8 +34,26 @@ def home():
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
+@app.get("/token/status")
+def token_status():
+    return {
+        "access_token_present": bool(auth.access_token),
+        "valid_till_utc": auth.expires_at,
+        "utc_now": time.time()
+    }
+
+@app.get("/scan")
+def scan(symbol: str):
+    token = auth.get_token()
+    r = requests.post(
+        f"{auth.base_url}/v2/marketfeed/quote",
+        headers={"access-token": token, "client-id": auth.client_id},
+        json={"NSE_EQ": [symbol]}
+    )
+    return r.json()
+
 @app.post("/order/place")
-async def order(symbol: str, qty: int, side: str, price: float = None):
+def order(symbol: str, qty: int, side: str, price: float = None):
     return place_order(symbol, qty, side, price)
 
 @app.get("/order/status")
