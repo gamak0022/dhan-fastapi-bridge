@@ -1,5 +1,5 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge — Full Market BTST Scanner Version
+# 🧠 Dhan FastAPI Bridge — Full Market BTST + Options Version
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -12,7 +12,11 @@ from io import StringIO
 # =========================================================
 # 🔧 Config
 # =========================================================
-app = FastAPI(title="Dhan FastAPI Bridge", version="3.0.0")
+app = FastAPI(
+    title="Dhan FastAPI Bridge",
+    version="3.1.0",
+    description="Live market intelligence bridge: BTST Scanner, Single Stock Scan, Option Chain, and Simulated Orders."
+)
 
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
@@ -27,7 +31,8 @@ MASTER_CSV = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 def home():
     return {
         "status": "ok",
-        "message": "Dhan FastAPI Bridge (Full Market BTST Scanner) 🚀",
+        "message": "Dhan FastAPI Bridge (Full Market BTST + Options) 🚀",
+        "version": "3.1.0",
         "endpoints": {
             "health": "/health",
             "scan_one": "/scan?symbol=RELIANCE",
@@ -48,23 +53,25 @@ def health_check():
 # 📊 Single Stock Scan
 # =========================================================
 @app.get("/scan")
-def get_quote(symbol: str = Query(...)):
+def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE")):
     """
     Fetch live market quote for a given symbol.
     """
     try:
-        # Load CSV to get security ID
-        csv_response = requests.get(MASTER_CSV)
+        csv_response = requests.get(MASTER_CSV, timeout=10)
         csv_data = csv.DictReader(StringIO(csv_response.text))
-        equity = next((r for r in csv_data if r["SYMBOL_NAME"].upper() == symbol.upper()), None)
+
+        equity = next(
+            (r for r in csv_data if r["SYMBOL_NAME"].upper() == symbol.upper()),
+            None
+        )
         if not equity:
-            raise HTTPException(status_code=404, detail="Symbol not found")
+            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found")
 
         security_id = int(equity["SECURITY_ID"])
         exch = equity["EXCH_ID"].upper()
         quote_key = "NSE_EQ" if exch == "NSE" else "BSE_EQ"
 
-        # Fetch live quote
         payload = {quote_key: [security_id]}
         res = requests.post(
             f"{DHAN_BASE}/marketfeed/quote",
@@ -74,10 +81,11 @@ def get_quote(symbol: str = Query(...)):
                 "client-id": DHAN_CLIENT_ID,
                 "Content-Type": "application/json",
             },
+            timeout=8,
         )
 
         if res.status_code != 200:
-            raise HTTPException(status_code=500, detail="Dhan quote fetch failed")
+            raise HTTPException(status_code=502, detail="Failed to fetch quote from Dhan")
 
         return {
             "status": "success",
@@ -88,6 +96,8 @@ def get_quote(symbol: str = Query(...)):
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+    except HTTPException as e:
+        raise e
     except Exception as e:
         return {"status": "error", "reason": str(e)}
 
@@ -97,11 +107,12 @@ def get_quote(symbol: str = Query(...)):
 @app.get("/optionchain")
 def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
     """
-    Fetch available option contracts for given symbol.
+    Fetch available option contracts for a given symbol.
     """
     try:
-        csv_response = requests.get(MASTER_CSV)
+        csv_response = requests.get(MASTER_CSV, timeout=10)
         csv_data = csv.DictReader(StringIO(csv_response.text))
+
         contracts = [
             {
                 "display_name": r["DISPLAY_NAME"],
@@ -129,6 +140,8 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+    except HTTPException as e:
+        raise e
     except Exception as e:
         return {"status": "error", "reason": str(e)}
 
@@ -136,16 +149,15 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
 # 📈 Bulk Market BTST Scanner
 # =========================================================
 @app.get("/scan/all")
-def scan_all(limit: int = Query(50, description="Top results to return")):
+def scan_all(limit: int = Query(50, description="Top results to return (default: 50)")):
     """
     Scans the entire Dhan equity universe (NSE/BSE cash)
-    and returns top BTST opportunities with bias/confidence.
+    and returns top BTST opportunities with bias and confidence.
     """
     try:
-        csv_response = requests.get(MASTER_CSV)
+        csv_response = requests.get(MASTER_CSV, timeout=15)
         csv_data = csv.DictReader(StringIO(csv_response.text))
 
-        # Filter only equity instruments
         equities = [
             r for r in csv_data
             if r["SEGMENT"].upper() != "D"
@@ -156,61 +168,63 @@ def scan_all(limit: int = Query(50, description="Top results to return")):
 
         results = []
         for eq in equities:
-            symbol = eq["SYMBOL_NAME"]
-            exch = eq["EXCH_ID"].upper()
-            security_id = int(eq["SECURITY_ID"])
-            quote_key = "NSE_EQ" if exch == "NSE" else "BSE_EQ"
+            try:
+                symbol = eq["SYMBOL_NAME"]
+                exch = eq["EXCH_ID"].upper()
+                security_id = int(eq["SECURITY_ID"])
+                quote_key = "NSE_EQ" if exch == "NSE" else "BSE_EQ"
 
-            # Fetch quote
-            payload = {quote_key: [security_id]}
-            res = requests.post(
-                f"{DHAN_BASE}/marketfeed/quote",
-                json=payload,
-                headers={
-                    "access-token": DHAN_ACCESS_TOKEN,
-                    "client-id": DHAN_CLIENT_ID,
-                    "Content-Type": "application/json",
-                },
-                timeout=5,
-            )
+                payload = {quote_key: [security_id]}
+                res = requests.post(
+                    f"{DHAN_BASE}/marketfeed/quote",
+                    json=payload,
+                    headers={
+                        "access-token": DHAN_ACCESS_TOKEN,
+                        "client-id": DHAN_CLIENT_ID,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=4,
+                )
 
-            if res.status_code != 200:
+                if res.status_code != 200:
+                    continue
+
+                q = res.json().get("data", {}).get(quote_key, {}).get(str(security_id), {})
+                if not q:
+                    continue
+
+                ohlc = q.get("ohlc", {})
+                last_price = q.get("last_price", 0)
+                close = ohlc.get("close", 0) or 1
+
+                # Technical bias logic
+                if last_price > close * 1.01:
+                    bias = "BULLISH"
+                    confidence = 80
+                elif last_price < close * 0.99:
+                    bias = "BEARISH"
+                    confidence = 80
+                else:
+                    bias = "NEUTRAL"
+                    confidence = 65
+
+                results.append({
+                    "symbol": symbol,
+                    "exchange": exch,
+                    "bias": bias,
+                    "confidence": confidence,
+                    "last_price": last_price,
+                })
+            except Exception:
                 continue
 
-            q = res.json().get("data", {}).get(quote_key, {}).get(str(security_id), {})
-            if not q:
-                continue
-
-            ohlc = q.get("ohlc", {})
-            last_price = q.get("last_price", 0)
-            close = ohlc.get("close", 0)
-
-            bias = "NEUTRAL"
-            confidence = 60
-
-            # Simple technical logic
-            if last_price > close * 1.01:
-                bias = "BULLISH"
-                confidence = 75
-            elif last_price < close * 0.99:
-                bias = "BEARISH"
-                confidence = 75
-
-            results.append({
-                "symbol": symbol,
-                "exchange": exch,
-                "bias": bias,
-                "confidence": confidence,
-                "last_price": last_price,
-            })
-
-        # Sort & return top results
         results = sorted(results, key=lambda x: x["confidence"], reverse=True)
+
         return {
             "status": "success",
             "timestamp": datetime.utcnow().isoformat(),
             "symbols_scanned": len(results),
-            "top_results": results[:limit]
+            "top_results": results[:limit],
         }
 
     except Exception as e:
@@ -220,10 +234,20 @@ def scan_all(limit: int = Query(50, description="Top results to return")):
 # 💰 Simulated Order
 # =========================================================
 @app.post("/order/place")
-def place_order(symbol: str = Query(...), qty: int = Query(1), side: str = Query(...)):
+def place_order(
+    symbol: str = Query(...),
+    qty: int = Query(1),
+    side: str = Query(..., regex="^(BUY|SELL|buy|sell)$")
+):
+    """
+    Simulates a buy/sell order (for GPT strategy testing).
+    """
     return {
         "status": "success",
-        "message": f"Simulated {side.upper()} order placed for {qty} shares of {symbol.upper()}",
+        "symbol": symbol.upper(),
+        "qty": qty,
+        "side": side.upper(),
+        "message": f"Simulated {side.upper()} order for {qty} shares of {symbol.upper()}",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
