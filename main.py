@@ -1,5 +1,5 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge v4.2.1 — BTST + Options + News + Sentiment
+# 🧠 Dhan FastAPI Bridge v5.0.0 — BTST + Options + Momentum + News + Sentiment
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -14,8 +14,8 @@ from io import StringIO
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="4.2.1",
-    description="Unified Dhan market data bridge for BTST scans, option chains, fuzzy symbol resolution, IST timestamps, and news sentiment."
+    version="5.0.0",
+    description="Unified Dhan market data bridge for BTST scans, option chains, fuzzy symbol resolution, momentum breakouts, and news sentiment."
 )
 
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
@@ -30,7 +30,7 @@ MASTER_CSV = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 # =========================================================
 def ist_now():
     """Return current Indian Standard Time (UTC+5:30)."""
-    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p IST")
 
 # =========================================================
 # 🏠 ROOT ENDPOINT
@@ -39,13 +39,14 @@ def ist_now():
 def home():
     return {
         "status": "ok",
-        "version": "4.2.1",
-        "message": "Dhan FastAPI Bridge — BTST + Options + News + Sentiment 🚀",
+        "version": "5.0.0",
+        "message": "Dhan FastAPI Bridge — BTST + Options + Momentum + News + Sentiment 🚀",
         "endpoints": {
             "health": "/health",
             "scan": "/scan?symbol=RELIANCE",
             "scan_all": "/scan/all?limit=50",
             "optionchain": "/optionchain?symbol=TCS",
+            "option_momentum": "/option/momentum?symbol=RELIANCE",
             "news": "/news?symbol=RELIANCE"
         },
         "timestamp": ist_now()
@@ -62,7 +63,6 @@ def health_check():
 # 📊 SMART SYMBOL RESOLVER
 # =========================================================
 def resolve_symbol(symbol: str):
-    """Resolve fuzzy matches for symbol using SYMBOL_NAME, DISPLAY_NAME, or UNDERLYING_SYMBOL."""
     csv_response = requests.get(MASTER_CSV, timeout=10)
     csv_data = list(csv.DictReader(StringIO(csv_response.text)))
     symbol_upper = symbol.upper().replace(" ", "")
@@ -89,6 +89,9 @@ def resolve_symbol(symbol: str):
 def get_news(symbol: str = Query(..., description="Stock symbol for sentiment analysis")):
     """Fetch top 5 market headlines for a given symbol."""
     try:
+        if not MARKETAUX_API_KEY:
+            return {"status": "error", "reason": "Missing MarketAux API key", "timestamp": ist_now()}
+
         url = f"https://api.marketaux.com/v1/news/all?symbols={symbol}&language=en&filter_entities=true&api_token={MARKETAUX_API_KEY}"
         res = requests.get(url, timeout=10)
 
@@ -176,7 +179,7 @@ def scan_all(limit: int = 50):
             and "OPT" not in r["INSTRUMENT"].upper()
             and "FUT" not in r["INSTRUMENT"].upper()
             and r["EXCH_ID"].upper() == "NSE"
-        ][:100]
+        ][:150]
 
         results = []
         for eq in equities:
@@ -206,10 +209,10 @@ def scan_all(limit: int = 50):
                 close = ohlc.get("close", 0) or 1
                 last_trade_time = q.get("last_trade_time", "N/A")
 
-                if last_price > close * 1.01:
-                    bias, confidence = "BULLISH", 80
-                elif last_price < close * 0.99:
-                    bias, confidence = "BEARISH", 80
+                if last_price > close * 1.015:
+                    bias, confidence = "BULLISH", 85
+                elif last_price < close * 0.985:
+                    bias, confidence = "BEARISH", 82
                 else:
                     bias, confidence = "NEUTRAL", 65
 
@@ -278,6 +281,76 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
             "expiry": expiry or contracts[0]["expiry"],
             "contracts_count": len(contracts),
             "contracts": contracts[:50],
+            "timestamp": ist_now()
+        }
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e), "timestamp": ist_now()}
+
+# =========================================================
+# 💥 OPTION MOMENTUM ANALYSIS (CE & PE)
+# =========================================================
+@app.get("/option/momentum")
+def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None)):
+    """Detects CE momentum breakouts and PE reversal/hedge opportunities."""
+    try:
+        csv_response = requests.get(MASTER_CSV)
+        csv_data = list(csv.DictReader(StringIO(csv_response.text)))
+
+        options = [
+            r for r in csv_data
+            if r["UNDERLYING_SYMBOL"].upper() == symbol.upper()
+            and "OPT" in r["INSTRUMENT"].upper()
+            and (not expiry or r["SM_EXPIRY_DATE"] == expiry)
+        ]
+
+        ce_list, pe_list = [], []
+        for opt in options[:40]:
+            strike = float(opt["STRIKE_PRICE"] or 0)
+            opt_type = opt["OPTION_TYPE"]
+            exch = opt["EXCH_ID"].upper()
+            sec_id = int(opt["SECURITY_ID"])
+            quote_key = "NSE_D" if exch == "NSE" else "BSE_D"
+
+            payload = {quote_key: [sec_id]}
+            res = requests.post(
+                f"{DHAN_BASE}/marketfeed/quote",
+                json=payload,
+                headers={
+                    "access-token": DHAN_ACCESS_TOKEN,
+                    "client-id": DHAN_CLIENT_ID,
+                    "Content-Type": "application/json",
+                },
+                timeout=5
+            )
+            if res.status_code != 200:
+                continue
+
+            q = res.json().get("data", {}).get(quote_key, {}).get(str(sec_id), {})
+            oi = q.get("oi", 0)
+            ltp = q.get("last_price", 0)
+            ohlc = q.get("ohlc", {})
+            change = ltp - ohlc.get("close", 0)
+
+            record = {"strike": strike, "ltp": ltp, "oi": oi, "change": change}
+
+            if opt_type == "CE":
+                ce_list.append(record)
+            else:
+                pe_list.append(record)
+
+        ce_momentum = [x for x in ce_list if x["change"] > 0 and x["oi"] > 0]
+        pe_opportunities = [x for x in pe_list if x["change"] > 0 and x["oi"] > 0]
+
+        ce_momentum.sort(key=lambda x: (x["change"], x["oi"]), reverse=True)
+        pe_opportunities.sort(key=lambda x: (x["change"], x["oi"]), reverse=True)
+
+        return {
+            "status": "success",
+            "symbol": symbol.upper(),
+            "expiry": expiry or "nearest",
+            "momentum_breakouts": ce_momentum[:3],
+            "pe_opportunities": pe_opportunities[:3],
             "timestamp": ist_now()
         }
 
