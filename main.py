@@ -1,9 +1,9 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge — BTST + Options (Vercel Optimized)
+# 🧠 Dhan FastAPI Bridge — BTST + Options (IST + Live Time)
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import os
 import csv
@@ -14,8 +14,8 @@ from io import StringIO
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="3.2.0",
-    description="Vercel-optimized Dhan market data bridge — BTST scanner, option chain, and trade simulation."
+    version="3.3.0",
+    description="Live market intelligence bridge with BTST scanning, option chain, and real-time IST timestamps."
 )
 
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
@@ -25,6 +25,13 @@ DHAN_BASE = "https://api.dhan.co/v2"
 MASTER_CSV = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
 # =========================================================
+# 🕒 IST Time Helper
+# =========================================================
+def ist_now():
+    """Return current Indian Standard Time as a string."""
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+
+# =========================================================
 # 🏠 Root
 # =========================================================
 @app.get("/")
@@ -32,14 +39,15 @@ def home():
     return {
         "status": "ok",
         "message": "Dhan FastAPI Bridge (Full Market BTST + Options) 🚀",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "endpoints": {
             "health": "/health",
             "scan_one": "/scan?symbol=RELIANCE",
             "scan_all": "/scan/all?limit=50",
             "optionchain": "/optionchain?symbol=TCS",
             "order": "/order/place"
-        }
+        },
+        "timestamp": ist_now()
     }
 
 # =========================================================
@@ -47,7 +55,7 @@ def home():
 # =========================================================
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": ist_now()}
 
 # =========================================================
 # 📊 Single Stock Scan
@@ -55,7 +63,7 @@ def health_check():
 @app.get("/scan")
 def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE, TCS, HDFCBANK")):
     """
-    Fetch live market quote for a given symbol with flexible matching.
+    Fetch live market quote for a given symbol (case-insensitive, flexible match).
     """
     try:
         csv_response = requests.get(MASTER_CSV, timeout=10)
@@ -93,19 +101,24 @@ def get_quote(symbol: str = Query(..., description="Stock symbol, e.g. RELIANCE,
         if res.status_code != 200:
             raise HTTPException(status_code=502, detail="Failed to fetch quote from Dhan")
 
+        data = res.json()
+        q = data.get("data", {}).get(quote_key, {}).get(str(security_id), {})
+        last_trade_time = q.get("last_trade_time", "N/A")
+
         return {
             "status": "success",
             "symbol": equity["SYMBOL_NAME"],
             "exchange": exch,
             "security_id": security_id,
-            "quote": res.json(),
-            "timestamp": datetime.utcnow().isoformat(),
+            "quote": data,
+            "last_trade_time": last_trade_time,
+            "timestamp": ist_now(),
         }
 
     except HTTPException as e:
         raise e
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        return {"status": "error", "reason": str(e), "timestamp": ist_now()}
 
 # =========================================================
 # ⚙️ Option Chain
@@ -143,16 +156,16 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
             "expiry": expiry or contracts[0]["expiry"],
             "contracts_count": len(contracts),
             "contracts": contracts[:50],
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": ist_now(),
         }
 
     except HTTPException as e:
         raise e
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        return {"status": "error", "reason": str(e), "timestamp": ist_now()}
 
 # =========================================================
-# ⚡ Optimized BTST Scanner (Safe for Vercel Runtime)
+# ⚡ Optimized BTST Scanner (IST + Live Time)
 # =========================================================
 @app.get("/scan/all")
 def scan_all(
@@ -160,7 +173,8 @@ def scan_all(
     sample_size: int = Query(150, description="Number of equities to scan (default: 150)")
 ):
     """
-    Fast BTST Scanner — scans a limited subset of equities (default 150) for Vercel runtime safety.
+    Fast BTST Scanner — scans limited equities (default 150) for Vercel runtime safety.
+    Includes live last trade time and IST report timestamp.
     """
     try:
         csv_response = requests.get(MASTER_CSV, timeout=15)
@@ -204,7 +218,9 @@ def scan_all(
                 ohlc = q.get("ohlc", {})
                 last_price = q.get("last_price", 0)
                 close = ohlc.get("close", 0) or 1
+                last_trade_time = q.get("last_trade_time", "N/A")
 
+                # Simple BTST bias logic
                 if last_price > close * 1.01:
                     bias = "BULLISH"
                     confidence = 80
@@ -221,6 +237,7 @@ def scan_all(
                     "bias": bias,
                     "confidence": confidence,
                     "last_price": last_price,
+                    "last_trade_time": last_trade_time
                 })
             except Exception:
                 continue
@@ -229,14 +246,14 @@ def scan_all(
 
         return {
             "status": "success",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": ist_now(),
             "symbols_scanned": len(results),
             "top_results": results[:limit],
             "note": "Fast scan mode active — limited to top 150 equities for Vercel runtime."
         }
 
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        return {"status": "error", "reason": str(e), "timestamp": ist_now()}
 
 # =========================================================
 # 💰 Simulated Order
@@ -256,7 +273,7 @@ def place_order(
         "qty": qty,
         "side": side.upper(),
         "message": f"Simulated {side.upper()} order for {qty} shares of {symbol.upper()}",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": ist_now(),
     }
 
 # =========================================================
