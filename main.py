@@ -1,5 +1,5 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge v5.0.0 — BTST + Options + Momentum + News + Sentiment
+# 🧠 Dhan FastAPI Bridge v5.0.1 — BTST + Options + Momentum + News + Sentiment
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -14,7 +14,7 @@ from io import StringIO
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="5.0.0",
+    version="5.0.1",
     description="Unified Dhan market data bridge for BTST scans, option chains, fuzzy symbol resolution, momentum breakouts, and news sentiment."
 )
 
@@ -39,7 +39,7 @@ def ist_now():
 def home():
     return {
         "status": "ok",
-        "version": "5.0.0",
+        "version": "5.0.1",
         "message": "Dhan FastAPI Bridge — BTST + Options + Momentum + News + Sentiment 🚀",
         "endpoints": {
             "health": "/health",
@@ -165,20 +165,20 @@ def get_quote(symbol: str = Query(...)):
         return {"status": "error", "reason": str(e), "timestamp": ist_now()}
 
 # =========================================================
-# ⚡ BTST MARKET SCANNER
+# ⚡ EQUITY-ONLY BTST MARKET SCANNER
 # =========================================================
 @app.get("/scan/all")
 def scan_all(limit: int = 50):
-    """Scan all NSE equities for BTST opportunities."""
+    """Scan NSE equities (only EQUITY/EQ/STOCK) for BTST opportunities."""
     try:
         csv_response = requests.get(MASTER_CSV, timeout=15)
         csv_data = list(csv.DictReader(StringIO(csv_response.text)))
+
+        # ✅ Filter only equity instruments
         equities = [
             r for r in csv_data
-            if r["SEGMENT"].upper() != "D"
-            and "OPT" not in r["INSTRUMENT"].upper()
-            and "FUT" not in r["INSTRUMENT"].upper()
-            and r["EXCH_ID"].upper() == "NSE"
+            if r["EXCH_ID"].upper() == "NSE"
+            and any(word in r["INSTRUMENT"].upper() for word in ["EQUITY", "EQ", "STOCK"])
         ][:150]
 
         results = []
@@ -200,8 +200,9 @@ def scan_all(limit: int = 50):
                     },
                     timeout=5,
                 )
+
                 q = res.json().get("data", {}).get(quote_key, {}).get(str(security_id), {})
-                if not q:
+                if not q or not q.get("last_price"):
                     continue
 
                 ohlc = q.get("ohlc", {})
@@ -220,7 +221,7 @@ def scan_all(limit: int = 50):
                     "symbol": symbol,
                     "bias": bias,
                     "confidence": confidence,
-                    "last_price": last_price,
+                    "last_price": round(last_price, 2),
                     "last_trade_time": last_trade_time
                 })
             except Exception:
