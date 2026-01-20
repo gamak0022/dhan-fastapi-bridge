@@ -1,31 +1,20 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from dhan_auth import DhanAuth
 from dhan_trade import place_order, order_status, cancel_order
-import os, requests
+import requests, os, time
 from datetime import datetime
 
-app = FastAPI(title="Dhan FastAPI Trading Bridge", version="2.0")
+app = FastAPI(title="Dhan Trading Bridge", version="1.0")
 auth = DhanAuth()
-
-# Optional protection: uncomment if you want API key
-# API_KEY = os.getenv("GPT_API_KEY")
-# @app.middleware("http")
-# async def verify_key(request: Request, call_next):
-#     if request.url.path not in ["/", "/health"]:
-#         if request.headers.get("x-api-key") != API_KEY:
-#             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-#     return await call_next(request)
 
 @app.get("/")
 def home():
     return {
         "status": "ok",
-        "message": "Dhan Trading Bridge live 🚀",
+        "message": "Dhan Trading Bridge running 🚀",
         "endpoints": {
             "health": "/health",
             "quote": "/scan?symbol=RELIANCE",
-            "optionchain": "/optionchain?symbol=TCS",
             "order": "/order/place"
         }
     }
@@ -37,19 +26,22 @@ def health():
 @app.get("/token/status")
 def token_status():
     return {
-        "access_token_present": bool(auth.access_token),
-        "valid_till_utc": auth.expires_at,
+        "has_token": bool(auth.access_token),
+        "valid_till": auth.expires_at,
         "utc_now": time.time()
     }
 
 @app.get("/scan")
 def scan(symbol: str):
+    """Fetch live quote"""
     token = auth.get_token()
-    r = requests.post(
-        f"{auth.base_url}/v2/marketfeed/quote",
-        headers={"access-token": token, "client-id": auth.client_id},
-        json={"NSE_EQ": [symbol]}
-    )
+    headers = {"access-token": token, "client-id": auth.client_id}
+    body = {"NSE_EQ": [symbol]}
+    r = requests.post(f"{auth.base_url}/v2/marketfeed/quote", headers=headers, json=body)
+    if r.status_code == 401:
+        auth._login_for_new_token()
+        headers["access-token"] = auth.access_token
+        r = requests.post(f"{auth.base_url}/v2/marketfeed/quote", headers=headers, json=body)
     return r.json()
 
 @app.post("/order/place")
