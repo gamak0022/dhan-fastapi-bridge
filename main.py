@@ -1,5 +1,5 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge v5.0.1 — BTST + Options + Momentum + News + Sentiment
+# 🧠 Dhan FastAPI Bridge v5.1.0 — BTST + Options + Momentum + News + Sentiment
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -14,8 +14,8 @@ from io import StringIO
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="5.0.1",
-    description="Unified Dhan market data bridge for BTST scans, option chains, fuzzy symbol resolution, momentum breakouts, and news sentiment."
+    version="5.1.0",
+    description="Unified Dhan market data bridge for BTST scans, option chains, equity-only momentum breakouts, and news sentiment integration."
 )
 
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
@@ -39,7 +39,7 @@ def ist_now():
 def home():
     return {
         "status": "ok",
-        "version": "5.0.1",
+        "version": "5.1.0",
         "message": "Dhan FastAPI Bridge — BTST + Options + Momentum + News + Sentiment 🚀",
         "endpoints": {
             "health": "/health",
@@ -165,21 +165,27 @@ def get_quote(symbol: str = Query(...)):
         return {"status": "error", "reason": str(e), "timestamp": ist_now()}
 
 # =========================================================
-# ⚡ EQUITY-ONLY BTST MARKET SCANNER
+# ⚡ EQUITY-ONLY BTST MARKET SCANNER (CLEAN FILTER)
 # =========================================================
 @app.get("/scan/all")
 def scan_all(limit: int = 50):
-    """Scan NSE equities (only EQUITY/EQ/STOCK) for BTST opportunities."""
+    """Scan NSE equities (only true EQUITY / EQ / STOCK) for BTST opportunities."""
     try:
         csv_response = requests.get(MASTER_CSV, timeout=15)
         csv_data = list(csv.DictReader(StringIO(csv_response.text)))
 
-        # ✅ Filter only equity instruments
+        # ✅ Strict equity filter — removes bonds, MFs, SDLs, ETFs
         equities = [
             r for r in csv_data
             if r["EXCH_ID"].upper() == "NSE"
-            and any(word in r["INSTRUMENT"].upper() for word in ["EQUITY", "EQ", "STOCK"])
-        ][:150]
+            and any(kw in r["INSTRUMENT"].upper() for kw in ["EQUITY", "EQ", "STOCK"])
+            and not any(
+                bad in (
+                    (r.get("DISPLAY_NAME", "") + " " + r.get("SYMBOL_NAME", "")).upper()
+                )
+                for bad in ["SDL", "MF", "AMC", "BOND", "FMP", "ETF", "DEBT", "GSEC", "GOVT"]
+            )
+        ][:200]
 
         results = []
         for eq in equities:
@@ -210,6 +216,7 @@ def scan_all(limit: int = 50):
                 close = ohlc.get("close", 0) or 1
                 last_trade_time = q.get("last_trade_time", "N/A")
 
+                # 🔹 BTST Logic
                 if last_price > close * 1.015:
                     bias, confidence = "BULLISH", 85
                 elif last_price < close * 0.985:
@@ -224,9 +231,11 @@ def scan_all(limit: int = 50):
                     "last_price": round(last_price, 2),
                     "last_trade_time": last_trade_time
                 })
+
             except Exception:
                 continue
 
+        # Sort by confidence descending
         results = sorted(results, key=lambda x: x["confidence"], reverse=True)
         return {
             "status": "success",
