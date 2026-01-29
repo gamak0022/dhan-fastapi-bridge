@@ -1,5 +1,5 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge v5.2.1 — BTST + Options + Momentum + News + Sentiment
+# 🧠 Dhan FastAPI Bridge v5.2.2 — BTST + Options + Momentum + News + Sentiment
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -16,7 +16,7 @@ from typing import Dict, List, Any, Optional
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="5.2.1",
+    version="5.2.2",
     description="Dhan market data bridge: BTST scan (NSE EQ universe), option chain, option momentum, news sentiment."
 )
 
@@ -37,7 +37,7 @@ _MASTER_CACHE: Dict[str, Any] = {
 }
 
 # Scan response cache to prevent repeated 429 (short TTL)
-SCAN_CACHE_TTL = 20  # seconds
+SCAN_CACHE_TTL = 25  # seconds
 _SCAN_CACHE: Dict[str, Dict[str, Any]] = {}  # key -> {"t": float, "resp": dict}
 
 SESSION = requests.Session()
@@ -84,7 +84,7 @@ def load_master_rows(force: bool = False) -> List[Dict[str, str]]:
     ):
         return _MASTER_CACHE["rows"]
 
-    res = SESSION.get(MASTER_CSV, timeout=20)
+    res = SESSION.get(MASTER_CSV, timeout=25)
     if res.status_code != 200:
         raise HTTPException(status_code=502, detail="Failed to fetch Dhan master CSV")
 
@@ -206,7 +206,7 @@ def home():
             "health": "/health",
             "universe": "/universe",
             "scan": "/scan?symbol=RELIANCE",
-            "scan_all": "/scan/all?limit=50&offset=0&max_symbols=200&batch_size=100",
+            "scan_all": "/scan/all?limit=30&offset=0",
             "optionchain": "/optionchain?symbol=TCS",
             "option_momentum": "/option/momentum?symbol=RELIANCE",
             "news": "/news?symbol=RELIANCE"
@@ -300,7 +300,7 @@ def dhan_quote_batch(quote_key: str, security_ids: List[int]) -> Dict[str, Any]:
     if res.status_code == 429:
         raise HTTPException(
             status_code=429,
-            detail="Dhan rate limit (429). Reduce max_symbols/batch_size or retry after 20–30 seconds."
+            detail="Dhan rate limit (429). Retry after ~20–30 seconds or reduce max_symbols/batch_size."
         )
 
     if res.status_code != 200:
@@ -347,19 +347,20 @@ def get_quote(symbol: str = Query(...)):
         return {"status": "error", "reason": str(e), "timestamp": ist_now_str()}
 
 # =========================================================
-# ⚡ BTST SCAN — NSE EQ UNIVERSE (PAGED + BATCHED + CACHED)
+# ⚡ BTST SCAN — NSE EQ UNIVERSE (PAGED + BATCHED + SAFE DEFAULTS)
 # =========================================================
 @app.get("/scan/all")
 def scan_all(
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(30, ge=1, le=200),
     offset: int = Query(0, ge=0, description="Universe offset for paging"),
-    max_symbols: int = Query(200, ge=50, le=600, description="How many symbols to scan in this call"),
-    batch_size: int = Query(100, ge=50, le=200, description="Quote batch size per Dhan request"),
+    # ✅ SAFE DEFAULTS (so /scan/all works without params)
+    max_symbols: int = Query(80, ge=50, le=600, description="How many symbols to scan in this call"),
+    batch_size: int = Query(60, ge=50, le=200, description="Quote batch size per Dhan request"),
     only_today: bool = Query(True, description="Skip stocks not traded today"),
 ):
     """
     Scans NSE equities (strict NSE/E/EQ universe) in pages.
-    Use offset to scan next pages: 0, 200, 400, 600, ...
+    Use offset to scan next pages: 0, 80, 160, 240, ...
     """
     cache_key = f"{offset}:{max_symbols}:{batch_size}:{only_today}"
     now = time.time()
@@ -374,10 +375,10 @@ def scan_all(
     try:
         universe = build_nse_eq_universe()
         universe_count = len(universe)
-
         page = universe[offset: offset + max_symbols]
+
         if not page:
-            return {
+            resp = {
                 "status": "success",
                 "timestamp": ist_now_str(),
                 "universe_count": universe_count,
@@ -387,18 +388,21 @@ def scan_all(
                 "top_results": [],
                 "note": "No symbols in this page (offset beyond universe)."
             }
+            _SCAN_CACHE[cache_key] = {"t": now, "resp": resp}
+            return resp
 
         security_ids = [x["security_id"] for x in page]
         quote_key = "NSE_EQ"
         today = ist_today()
 
-        # Batched quote fetch (with a tiny pause between batches to reduce 429 risk)
         qmaps: Dict[str, Any] = {}
+
+        # Batched quote fetch with throttle to reduce 429
         for i in range(0, len(security_ids), batch_size):
             chunk = security_ids[i:i + batch_size]
             qmaps.update(dhan_quote_batch(quote_key, chunk))
             if i + batch_size < len(security_ids):
-                time.sleep(0.12)  # small throttle
+                time.sleep(0.25)  # ✅ stronger throttle
 
         results = []
         skipped_no_quote = 0
@@ -424,7 +428,7 @@ def scan_all(
             ohlc = q.get("ohlc", {}) or {}
             prev_close = ohlc.get("close") or float(last_price) or 1.0
 
-            # Simple BTST heuristic (same as your earlier logic, but cleaner data)
+            # BTST heuristic
             if float(last_price) > float(prev_close) * 1.015:
                 bias, confidence = "BULLISH", 85
             elif float(last_price) < float(prev_close) * 0.985:
@@ -452,7 +456,7 @@ def scan_all(
         next_offset = offset + max_symbols
         has_more = next_offset < universe_count
 
-        response = {
+        resp = {
             "status": "success",
             "timestamp": ist_now_str(),
             "source": MASTER_CSV,
@@ -470,11 +474,10 @@ def scan_all(
             "paging": {"has_more": has_more, "next_offset": next_offset if has_more else None}
         }
 
-        _SCAN_CACHE[cache_key] = {"t": now, "resp": response}
-        return response
+        _SCAN_CACHE[cache_key] = {"t": now, "resp": resp}
+        return resp
 
     except HTTPException as he:
-        # cache rate-limit error briefly so refresh doesn't hammer again
         err_resp = {"status": "error", "reason": he.detail, "timestamp": ist_now_str()}
         _SCAN_CACHE[cache_key] = {"t": now, "resp": err_resp}
         raise
@@ -563,7 +566,6 @@ def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None))
         records_meta: Dict[int, Dict[str, Any]] = {}
         sec_ids: List[int] = []
 
-        # Keep it serverless-safe
         for opt in options[:120]:
             opt_type = (opt.get("OPTION_TYPE") or "").upper()
             if opt_type not in ("CE", "PE"):
@@ -591,7 +593,7 @@ def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None))
             chunk = sec_ids[i:i + 200]
             quotes.update(dhan_quote_batch(quote_key, chunk))
             if i + 200 < len(sec_ids):
-                time.sleep(0.12)
+                time.sleep(0.25)
 
         ce_list, pe_list = [], []
 
