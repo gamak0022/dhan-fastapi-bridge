@@ -1,5 +1,9 @@
 # =========================================================
-# 🧠 Dhan FastAPI Bridge v5.2.2 — BTST + Options + Momentum + News + Sentiment
+# 🧠 Dhan FastAPI Bridge v5.3.0 — BTST + Options + Momentum + News + Sentiment
+# ✅ NSE Equity Universe (NSE / E / EQ)
+# ✅ Uses % vs DAY OPEN (works morning + close)
+# ✅ Safe defaults to avoid 429
+# ✅ Samples across whole universe by default (no paging needed for GPT)
 # =========================================================
 
 from fastapi import FastAPI, Query, HTTPException
@@ -16,8 +20,8 @@ from typing import Dict, List, Any, Optional
 # =========================================================
 app = FastAPI(
     title="Dhan FastAPI Bridge",
-    version="5.2.2",
-    description="Dhan market data bridge: BTST scan (NSE EQ universe), option chain, option momentum, news sentiment."
+    version="5.3.0",
+    description="BTST scan (NSE EQ universe), option chain, option momentum, news sentiment."
 )
 
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
@@ -27,23 +31,18 @@ MARKETAUX_API_KEY = os.getenv("MARKETAUX_API_KEY")
 DHAN_BASE = "https://api.dhan.co/v2"
 MASTER_CSV = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
-# Master CSV cache (serverless-safe: works while instance warm)
+SESSION = requests.Session()
+
+# Master CSV cache (warm instance only)
 MASTER_CACHE_TTL = 6 * 60 * 60  # 6 hours
+_MASTER_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "rows": None, "nse_eq_universe": None}
 
-_MASTER_CACHE: Dict[str, Any] = {
-    "fetched_at": 0.0,
-    "rows": None,             # Optional[List[Dict[str,str]]]
-    "nse_eq_universe": None,  # Optional[List[Dict[str,Any]]]
-}
-
-# Scan response cache to prevent repeated 429 (short TTL)
+# Short scan cache to avoid repeated 429 on refresh
 SCAN_CACHE_TTL = 25  # seconds
 _SCAN_CACHE: Dict[str, Dict[str, Any]] = {}  # key -> {"t": float, "resp": dict}
 
-SESSION = requests.Session()
-
 # =========================================================
-# 🕒 UTIL: INDIAN STANDARD TIME
+# 🕒 UTIL
 # =========================================================
 def ist_now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p IST")
@@ -52,7 +51,6 @@ def ist_today() -> date:
     return (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
 
 def parse_last_trade_date(last_trade_time: str) -> Optional[date]:
-    # Typically: "29/01/2026 15:49:31"
     if not last_trade_time or last_trade_time == "N/A":
         return None
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
@@ -64,24 +62,17 @@ def parse_last_trade_date(last_trade_time: str) -> Optional[date]:
 
 def require_dhan_creds():
     if not DHAN_ACCESS_TOKEN or not DHAN_CLIENT_ID:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID in environment."
-        )
+        raise HTTPException(status_code=500, detail="Missing DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID in env.")
 
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").upper() if ch.isalnum())
 
 # =========================================================
-# 🧾 MASTER CSV LOADER (CACHED)
+# 🧾 MASTER CSV (CACHED)
 # =========================================================
 def load_master_rows(force: bool = False) -> List[Dict[str, str]]:
     now = time.time()
-    if (
-        not force
-        and _MASTER_CACHE["rows"] is not None
-        and (now - _MASTER_CACHE["fetched_at"] < MASTER_CACHE_TTL)
-    ):
+    if (not force and _MASTER_CACHE["rows"] is not None and (now - _MASTER_CACHE["fetched_at"] < MASTER_CACHE_TTL)):
         return _MASTER_CACHE["rows"]
 
     res = SESSION.get(MASTER_CSV, timeout=25)
@@ -91,16 +82,14 @@ def load_master_rows(force: bool = False) -> List[Dict[str, str]]:
     rows = list(csv.DictReader(StringIO(res.text)))
     _MASTER_CACHE["rows"] = rows
     _MASTER_CACHE["fetched_at"] = now
-    _MASTER_CACHE["nse_eq_universe"] = None  # reset derived cache
+    _MASTER_CACHE["nse_eq_universe"] = None
     return rows
 
 def build_nse_eq_universe(force_refresh: bool = False) -> List[Dict[str, Any]]:
     """
-    ✅ True equity universe:
-      EXCH_ID = NSE
-      SEGMENT = E
-      SERIES  = EQ
-    Returns: [{security_id, symbol_name, display_name}]
+    ✅ Strict universe:
+      EXCH_ID=NSE, SEGMENT=E, SERIES=EQ
+    Plus extra filtering to remove ETFs/MFs etc.
     """
     if force_refresh:
         load_master_rows(force=True)
@@ -117,18 +106,20 @@ def build_nse_eq_universe(force_refresh: bool = False) -> List[Dict[str, Any]]:
         seg = (r.get("SEGMENT") or "").strip().upper()
         series = (r.get("SERIES") or "").strip().upper()
 
-        if exch != "NSE":
-            continue
-        if seg != "E":
-            continue
-        if series != "EQ":
+        if exch != "NSE" or seg != "E" or series != "EQ":
             continue
 
         sid_raw = (r.get("SECURITY_ID") or "").strip()
         sym = (r.get("SYMBOL_NAME") or "").strip()
         disp = (r.get("DISPLAY_NAME") or "").strip()
+        instr = (r.get("INSTRUMENT") or "").strip().upper()
 
         if not sid_raw or not sym:
+            continue
+
+        # Extra exclusion: remove ETFs/MFs/bonds/etc if they sneak in
+        name_blob = f"{sym} {disp} {instr}".upper()
+        if any(bad in name_blob for bad in ["ETF", "MUTUAL", "MF", "BOND", "GSEC", "GOVT", "SDL", "NCD", "DEBENTURE"]):
             continue
 
         try:
@@ -141,23 +132,15 @@ def build_nse_eq_universe(force_refresh: bool = False) -> List[Dict[str, Any]]:
             continue
         seen.add(key)
 
-        universe.append({
-            "security_id": security_id,
-            "symbol_name": sym,
-            "display_name": disp or sym,
-        })
+        universe.append({"security_id": security_id, "symbol_name": sym, "display_name": disp or sym})
 
     _MASTER_CACHE["nse_eq_universe"] = universe
     return universe
 
 # =========================================================
-# 📊 SMART SYMBOL RESOLVER (CACHED MASTER)
+# 📊 SYMBOL RESOLVER
 # =========================================================
 def resolve_symbol(symbol: str) -> Dict[str, str]:
-    """
-    Resolve by matching SYMBOL_NAME / DISPLAY_NAME / UNDERLYING_SYMBOL.
-    Prefers NSE if multiple matches.
-    """
     rows = load_master_rows()
     s = _norm(symbol)
 
@@ -177,11 +160,7 @@ def resolve_symbol(symbol: str) -> Dict[str, str]:
 
     candidates = []
     for r in rows:
-        combined = _norm(" ".join([
-            r.get("SYMBOL_NAME", ""),
-            r.get("DISPLAY_NAME", ""),
-            r.get("UNDERLYING_SYMBOL", "")
-        ]))
+        combined = _norm(" ".join([r.get("SYMBOL_NAME", ""), r.get("DISPLAY_NAME", ""), r.get("UNDERLYING_SYMBOL", "")]))
         if s and s in combined:
             candidates.append(r)
 
@@ -194,19 +173,19 @@ def resolve_symbol(symbol: str) -> Dict[str, str]:
     return candidates[0]
 
 # =========================================================
-# 🏠 ROOT ENDPOINT
+# 🏠 ROOT + HEALTH
 # =========================================================
 @app.get("/")
 def home():
     return {
         "status": "ok",
         "version": app.version,
-        "message": "Dhan FastAPI Bridge — BTST + Options + Momentum + News + Sentiment 🚀",
+        "message": "Dhan FastAPI Bridge — BTST scan + Options + Momentum + News",
         "endpoints": {
             "health": "/health",
             "universe": "/universe",
-            "scan": "/scan?symbol=RELIANCE",
-            "scan_all": "/scan/all?limit=30&offset=0",
+            "scan": "/scan?symbol=HINDUSTAN%20COPPER",
+            "scan_all": "/scan/all?limit=30",
             "optionchain": "/optionchain?symbol=TCS",
             "option_momentum": "/option/momentum?symbol=RELIANCE",
             "news": "/news?symbol=RELIANCE"
@@ -214,15 +193,12 @@ def home():
         "timestamp": ist_now_str()
     }
 
-# =========================================================
-# 🩺 HEALTH CHECK
-# =========================================================
 @app.get("/health")
 def health_check():
     return {"status": "ok", "time": ist_now_str()}
 
 # =========================================================
-# ✅ UNIVERSE DEBUG (VERIFY ALL NSE EQ)
+# ✅ UNIVERSE DEBUG
 # =========================================================
 @app.get("/universe")
 def universe_debug(
@@ -234,7 +210,6 @@ def universe_debug(
     if q:
         nq = _norm(q)
         u = [x for x in u if nq in _norm(x["symbol_name"]) or nq in _norm(x["display_name"])]
-
     return {
         "status": "success",
         "source": MASTER_CSV,
@@ -245,10 +220,10 @@ def universe_debug(
     }
 
 # =========================================================
-# 📰 NEWS + SENTIMENT (MARKETAUX)
+# 📰 NEWS (MARKETAUX)
 # =========================================================
 @app.get("/news")
-def get_news(symbol: str = Query(..., description="Stock symbol for sentiment analysis")):
+def get_news(symbol: str = Query(...)):
     try:
         if not MARKETAUX_API_KEY:
             return {"status": "error", "reason": "Missing MarketAux API key", "timestamp": ist_now_str()}
@@ -280,7 +255,7 @@ def get_news(symbol: str = Query(..., description="Stock symbol for sentiment an
         return {"status": "error", "reason": str(e), "timestamp": ist_now_str()}
 
 # =========================================================
-# 🔌 DHAN QUOTE (BATCHED)
+# 🔌 DHAN QUOTE (BATCH)
 # =========================================================
 def dhan_quote_batch(quote_key: str, security_ids: List[int]) -> Dict[str, Any]:
     require_dhan_creds()
@@ -296,13 +271,8 @@ def dhan_quote_batch(quote_key: str, security_ids: List[int]) -> Dict[str, Any]:
         timeout=8,
     )
 
-    # ✅ Graceful rate-limit message
     if res.status_code == 429:
-        raise HTTPException(
-            status_code=429,
-            detail="Dhan rate limit (429). Retry after ~20–30 seconds or reduce max_symbols/batch_size."
-        )
-
+        raise HTTPException(status_code=429, detail="Dhan rate limit (429). Retry after ~20–30 seconds.")
     if res.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Dhan quote API failed ({res.status_code})")
 
@@ -310,10 +280,10 @@ def dhan_quote_batch(quote_key: str, security_ids: List[int]) -> Dict[str, Any]:
     return data.get(quote_key, {})
 
 # =========================================================
-# 📈 SINGLE STOCK SCAN + SENTIMENT
+# 📈 SINGLE STOCK SCAN
 # =========================================================
 @app.get("/scan")
-def get_quote(symbol: str = Query(...)):
+def scan_single(symbol: str = Query(...)):
     try:
         equity = resolve_symbol(symbol)
         exch = (equity.get("EXCH_ID") or "").upper()
@@ -322,20 +292,16 @@ def get_quote(symbol: str = Query(...)):
 
         qmap = dhan_quote_batch(quote_key, [security_id])
         q = qmap.get(str(security_id), {}) or {}
-        last_trade_time = q.get("last_trade_time", "N/A")
 
         news_data = get_news(symbol)
-        sentiment_summary = [
-            f"{a.get('title')} ({a.get('sentiment')})"
-            for a in news_data.get("articles", [])
-        ]
+        sentiment_summary = [f"{a.get('title')} ({a.get('sentiment')})" for a in news_data.get("articles", [])]
 
         return {
             "status": "success",
             "symbol": equity.get("SYMBOL_NAME", symbol),
             "exchange": exch,
             "security_id": security_id,
-            "last_trade_time": last_trade_time,
+            "last_trade_time": q.get("last_trade_time", "N/A"),
             "timestamp": ist_now_str(),
             "quote": q,
             "news_sentiment": sentiment_summary
@@ -347,26 +313,28 @@ def get_quote(symbol: str = Query(...)):
         return {"status": "error", "reason": str(e), "timestamp": ist_now_str()}
 
 # =========================================================
-# ⚡ BTST SCAN — NSE EQ UNIVERSE (PAGED + BATCHED + SAFE DEFAULTS)
+# ⚡ BTST SCAN (works morning + close)
+# ✅ Default = sample across whole universe (so GPT doesn’t need paging)
 # =========================================================
 @app.get("/scan/all")
 def scan_all(
     limit: int = Query(30, ge=1, le=200),
-    offset: int = Query(0, ge=0, description="Universe offset for paging"),
-    # ✅ SAFE DEFAULTS (so /scan/all works without params)
-    max_symbols: int = Query(80, ge=50, le=600, description="How many symbols to scan in this call"),
-    batch_size: int = Query(60, ge=50, le=200, description="Quote batch size per Dhan request"),
-    only_today: bool = Query(True, description="Skip stocks not traded today"),
+    # SAFE DEFAULTS (avoid 429, also tool can’t pass these)
+    max_symbols: int = Query(50, ge=20, le=200, description="How many symbols to scan per request"),
+    batch_size: int = Query(50, ge=20, le=100, description="Quote batch size per Dhan request"),
+    only_today: bool = Query(True),
+    # IMPORTANT: covers the whole universe without paging
+    spread: bool = Query(True, description="If true, sample across the entire universe (recommended)."),
+    spread_shift: int = Query(0, ge=0, le=5000, description="Shift start index for spread sampling"),
+    mode: str = Query("btst", description="btst | morning"),
 ):
     """
-    Scans NSE equities (strict NSE/E/EQ universe) in pages.
-    Use offset to scan next pages: 0, 80, 160, 240, ...
+    - mode=morning: focuses on intraday momentum vs OPEN.
+    - mode=btst: adds close-near-high filter (still based on OPEN).
     """
-    cache_key = f"{offset}:{max_symbols}:{batch_size}:{only_today}"
+    cache_key = f"{limit}:{max_symbols}:{batch_size}:{only_today}:{spread}:{spread_shift}:{mode}"
     now = time.time()
     cached = _SCAN_CACHE.get(cache_key)
-
-    # ✅ Return cached results to avoid repeated 429 on refresh
     if cached and (now - cached["t"] < SCAN_CACHE_TTL):
         resp = cached["resp"]
         resp["top_results"] = resp.get("top_results", [])[:limit]
@@ -375,34 +343,33 @@ def scan_all(
     try:
         universe = build_nse_eq_universe()
         universe_count = len(universe)
-        page = universe[offset: offset + max_symbols]
+        today = ist_today()
 
-        if not page:
-            resp = {
-                "status": "success",
-                "timestamp": ist_now_str(),
-                "universe_count": universe_count,
-                "offset": offset,
-                "max_symbols": max_symbols,
-                "symbols_scanned": 0,
-                "top_results": [],
-                "note": "No symbols in this page (offset beyond universe)."
-            }
-            _SCAN_CACHE[cache_key] = {"t": now, "resp": resp}
-            return resp
+        # Choose which symbols to scan
+        if spread:
+            # stride sample across entire universe so we don’t always scan the same first 50
+            stride = max(1, universe_count // max_symbols)
+            indices = []
+            start = spread_shift % max(1, universe_count)
+            i = start
+            while len(indices) < max_symbols and i < universe_count:
+                indices.append(i)
+                i += stride
+            page = [universe[idx] for idx in indices if idx < universe_count]
+        else:
+            # sequential first N (not recommended unless you page manually)
+            page = universe[:max_symbols]
 
         security_ids = [x["security_id"] for x in page]
         quote_key = "NSE_EQ"
-        today = ist_today()
 
+        # Batch fetch with small throttle (reduces 429)
         qmaps: Dict[str, Any] = {}
-
-        # Batched quote fetch with throttle to reduce 429
         for i in range(0, len(security_ids), batch_size):
             chunk = security_ids[i:i + batch_size]
             qmaps.update(dhan_quote_batch(quote_key, chunk))
             if i + batch_size < len(security_ids):
-                time.sleep(0.25)  # ✅ stronger throttle
+                time.sleep(0.25)
 
         results = []
         skipped_no_quote = 0
@@ -413,48 +380,71 @@ def scan_all(
             sym = item["symbol_name"]
 
             q = qmaps.get(str(sid), {}) or {}
-            last_price = q.get("last_price")
-            if not last_price:
+            ltp = q.get("last_price")
+            if not ltp:
                 skipped_no_quote += 1
                 continue
 
-            last_trade_time = q.get("last_trade_time", "N/A")
+            ltt = q.get("last_trade_time", "N/A")
             if only_today:
-                d = parse_last_trade_date(last_trade_time)
+                d = parse_last_trade_date(ltt)
                 if d is None or d != today:
                     skipped_stale += 1
                     continue
 
             ohlc = q.get("ohlc", {}) or {}
-            prev_close = ohlc.get("close") or float(last_price) or 1.0
+            day_open = ohlc.get("open") or 0
+            day_high = ohlc.get("high") or 0
+            day_low = ohlc.get("low") or 0
+            vol = q.get("volume", 0) or 0
 
-            # BTST heuristic
-            if float(last_price) > float(prev_close) * 1.015:
-                bias, confidence = "BULLISH", 85
-            elif float(last_price) < float(prev_close) * 0.985:
-                bias, confidence = "BEARISH", 82
+            if not day_open:
+                # if open missing, skip because morning logic depends on it
+                skipped_no_quote += 1
+                continue
+
+            pct_vs_open = ((float(ltp) - float(day_open)) / float(day_open)) * 100.0
+
+            # range position: 0 = at low, 1 = at high
+            range_pos = 0.5
+            if day_high and day_low and day_high != day_low:
+                range_pos = (float(ltp) - float(day_low)) / (float(day_high) - float(day_low))
+                range_pos = max(0.0, min(1.0, range_pos))
+
+            # Scoring heuristic
+            bullish = pct_vs_open >= 1.2
+            bearish = pct_vs_open <= -1.2
+
+            # For BTST, we prefer close nearer to high (range_pos)
+            if mode.lower() == "btst":
+                if bullish and range_pos >= 0.70:
+                    bias, confidence = "BULLISH", 85
+                elif bearish and range_pos <= 0.30:
+                    bias, confidence = "BEARISH", 82
+                else:
+                    bias, confidence = "NEUTRAL", 65
             else:
-                bias, confidence = "NEUTRAL", 65
-
-            pct = 0.0
-            try:
-                pct = ((float(last_price) - float(prev_close)) / float(prev_close)) * 100.0
-            except Exception:
-                pct = 0.0
+                # Morning mode: momentum vs open only (lighter)
+                if bullish:
+                    bias, confidence = "BULLISH", 80
+                elif bearish:
+                    bias, confidence = "BEARISH", 78
+                else:
+                    bias, confidence = "NEUTRAL", 65
 
             results.append({
                 "symbol": sym,
                 "bias": bias,
                 "confidence": confidence,
-                "last_price": round(float(last_price), 2),
-                "pct_vs_prev_close": round(float(pct), 2),
-                "last_trade_time": last_trade_time
+                "last_price": round(float(ltp), 2),
+                "pct_vs_open": round(float(pct_vs_open), 2),
+                "range_pos": round(float(range_pos), 2),
+                "volume": int(vol),
+                "last_trade_time": ltt
             })
 
-        results.sort(key=lambda x: (x["confidence"], x["pct_vs_prev_close"]), reverse=True)
-
-        next_offset = offset + max_symbols
-        has_more = next_offset < universe_count
+        # Sort: confidence then pct_vs_open
+        results.sort(key=lambda x: (x["confidence"], x["pct_vs_open"]), reverse=True)
 
         resp = {
             "status": "success",
@@ -462,33 +452,33 @@ def scan_all(
             "source": MASTER_CSV,
             "filters": {"EXCH_ID": "NSE", "SEGMENT": "E", "SERIES": "EQ"},
             "universe_count": universe_count,
-            "offset": offset,
+            "spread": spread,
+            "spread_shift": spread_shift,
             "max_symbols": max_symbols,
             "batch_size": batch_size,
+            "mode": mode,
             "only_today": only_today,
-            "symbols_in_page": len(page),
             "symbols_scanned": len(results),
             "skipped_no_quote": skipped_no_quote,
             "skipped_stale": skipped_stale,
-            "top_results": results[:limit],
-            "paging": {"has_more": has_more, "next_offset": next_offset if has_more else None}
+            "top_results": results[:limit]
         }
 
         _SCAN_CACHE[cache_key] = {"t": now, "resp": resp}
         return resp
 
     except HTTPException as he:
-        err_resp = {"status": "error", "reason": he.detail, "timestamp": ist_now_str()}
-        _SCAN_CACHE[cache_key] = {"t": now, "resp": err_resp}
+        err = {"status": "error", "reason": he.detail, "timestamp": ist_now_str()}
+        _SCAN_CACHE[cache_key] = {"t": now, "resp": err}
         raise
     except Exception as e:
         return {"status": "error", "reason": str(e), "timestamp": ist_now_str()}
 
 # =========================================================
-# ⚙️ OPTION CHAIN (MASTER CSV CACHE)
+# ⚙️ OPTION CHAIN (LIST CONTRACTS)
 # =========================================================
 @app.get("/optionchain")
-def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
+def optionchain(symbol: str = Query(...), expiry: str = Query(None)):
     try:
         rows = load_master_rows()
         contracts = []
@@ -548,10 +538,10 @@ def get_optionchain(symbol: str = Query(...), expiry: str = Query(None)):
         return {"status": "error", "reason": str(e), "timestamp": ist_now_str()}
 
 # =========================================================
-# 💥 OPTION MOMENTUM ANALYSIS (CE & PE)
+# 💥 OPTION MOMENTUM (SUBSET)
 # =========================================================
 @app.get("/option/momentum")
-def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None)):
+def option_momentum(symbol: str = Query(...), expiry: str = Query(None)):
     try:
         require_dhan_creds()
         rows = load_master_rows()
@@ -587,7 +577,6 @@ def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None))
             sec_ids.append(sec_id)
 
         quote_key = "NSE_D"
-
         quotes: Dict[str, Any] = {}
         for i in range(0, len(sec_ids), 200):
             chunk = sec_ids[i:i + 200]
@@ -596,7 +585,6 @@ def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None))
                 time.sleep(0.25)
 
         ce_list, pe_list = [], []
-
         for sec_id_str, q in quotes.items():
             try:
                 sid = int(sec_id_str)
@@ -617,12 +605,11 @@ def analyze_option_momentum(symbol: str = Query(...), expiry: str = Query(None))
             prev_close = ohlc.get("close", 0) or 0
             change = float(ltp) - float(prev_close)
 
-            record = {"strike": strike, "ltp": ltp, "oi": oi, "change": round(change, 2)}
-
+            rec = {"strike": strike, "ltp": ltp, "oi": oi, "change": round(change, 2)}
             if opt_type == "CE":
-                ce_list.append(record)
+                ce_list.append(rec)
             else:
-                pe_list.append(record)
+                pe_list.append(rec)
 
         ce_momentum = [x for x in ce_list if x["change"] > 0 and x["oi"] > 0]
         pe_opportunities = [x for x in pe_list if x["change"] > 0 and x["oi"] > 0]
